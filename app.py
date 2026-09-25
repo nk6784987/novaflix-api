@@ -1,0 +1,214 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import requests
+from bs4 import BeautifulSoup
+from cachetools import TTLCache
+import logging
+
+app = Flask(__name__)
+# Enable CORS so frontend web and mobile applications can access the API endpoints
+CORS(app)
+
+# Configure system logging for tracking requests and debug info
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("anime_api")
+
+# TTLCache stores up to 200 items for 900 seconds (15 minutes)
+cache = TTLCache(maxsize=200, ttl=900)
+
+BASE_URL = "https://watchanimeworld.one"
+
+# Default browser headers to prevent basic scraping blocks
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer": BASE_URL
+}
+
+def fetch_soup(url):
+    """Utility function to fetch HTML content and parse it into BeautifulSoup."""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=12)
+        response.raise_for_status()
+        return BeautifulSoup(response.text, 'html.parser')
+    except requests.RequestException as e:
+        logger.error(f"Error fetching URL {url}: {e}")
+        return None
+
+def scrape_anime_list(search_query=None):
+    """Scrapes trending or searched anime list from watchanimeworld.one."""
+    target_url = f"{BASE_URL}/?s={search_query}" if search_query else BASE_URL
+    soup = fetch_soup(target_url)
+    
+    if not soup:
+        return []
+
+    anime_results = []
+    
+    # Target common article/card containers on modern WP anime themes
+    articles = soup.find_all(['article', 'div'], class_=['post', 'item', 'animepost', 'bs', 'result-item'])
+    
+    if not articles:
+        articles = soup.select('.listupd article, .result article, .animposx')
+
+    for item in articles:
+        try:
+            link_tag = item.find('a')
+            if not link_tag:
+                continue
+                
+            link = link_tag.get('href', '')
+            
+            # Extract title safely
+            title = (
+                link_tag.get('title') 
+                or (item.find(['h2', 'h3', 'h4', 'span']) and item.find(['h2', 'h3', 'h4', 'span']).text.strip())
+                or ""
+            )
+            
+            # Extract poster image URL
+            img_tag = item.find('img')
+            img_url = ""
+            if img_tag:
+                img_url = img_tag.get('data-src') or img_tag.get('src') or ""
+                if img_url.startswith('//'):
+                    img_url = 'https:' + img_url
+
+            # Extract status/type badge
+            status_tag = item.find(class_=['epx', 'type', 'bt', 'sub', 'dub', 'status'])
+            status = status_tag.text.strip() if status_tag else "N/A"
+
+            # Extract synopsis excerpt
+            desc_tag = item.find(class_=['entry-content', 'excerpt', 'desc'])
+            description = desc_tag.text.strip() if desc_tag else "No description available."
+
+            if title and link:
+                anime_results.append({
+                    "title": title,
+                    "image": img_url,
+                    "link": link,
+                    "status": status,
+                    "description": description
+                })
+        except Exception as e:
+            logger.warning(f"Error parsing anime item: {e}")
+            continue
+
+    return anime_results
+
+def scrape_anime_details(detail_url):
+    """Scrapes detailed anime info, synopsis, episodes, and stream embeds."""
+    soup = fetch_soup(detail_url)
+    if not soup:
+        return None
+
+    try:
+        title_tag = soup.find(['h1', 'h2'], class_=['entry-title', 'title'])
+        title = title_tag.text.strip() if title_tag else "Unknown Title"
+
+        img_tag = soup.find('img', class_=['attachment-post-thumbnail', 'wp-post-image']) or soup.select_one('.thumb img')
+        img_url = img_tag.get('data-src') or img_tag.get('src') if img_tag else ""
+
+        desc_container = soup.find('div', class_=['entry-content', 'description', 'synopsis'])
+        description = desc_container.text.strip() if desc_container else "No synopsis available."
+
+        # Extract episode links
+        episodes = []
+        episode_tags = soup.select('.eplister li a, .list-eps li a, .ep-list a')
+        for ep in episode_tags:
+            ep_title = ep.text.strip()
+            ep_href = ep.get('href')
+            if ep_href:
+                episodes.append({
+                    "title": ep_title,
+                    "link": ep_href
+                })
+
+        # Extract stream player iframe if present
+        iframe = soup.find('iframe')
+        embed_url = iframe.get('src') if iframe else None
+
+        return {
+            "title": title,
+            "image": img_url,
+            "description": description,
+            "episodes": episodes,
+            "embed_url": embed_url
+        }
+    except Exception as e:
+        logger.error(f"Error scraping details page: {e}")
+        return None
+
+@app.route('/', methods=['GET'])
+def index():
+    """Health check and API overview route."""
+    return jsonify({
+        "status": "online",
+        "service": "WatchAnimeWorld Scraping Proxy API",
+        "cached_entries": len(cache),
+        "endpoints": {
+            "anime_list": "/api/anime",
+            "search_anime": "/api/anime?search=naruto",
+            "anime_details": "/api/details?url=https://watchanimeworld.one/anime/example"
+        }
+    })
+
+@app.route('/api/anime', methods=['GET'])
+def get_anime():
+    """GET /api/anime - Returns anime list (supports search query)."""
+    search_query = request.args.get('search', '').strip()
+    cache_key = f"list_{search_query}"
+
+    if cache_key in cache:
+        logger.info(f"Serving from cache: {cache_key}")
+        return jsonify({
+            "success": True,
+            "cached": True,
+            "count": len(cache[cache_key]),
+            "data": cache[cache_key]
+        })
+
+    logger.info(f"Fetching fresh data for search='{search_query}'")
+    data = scrape_anime_list(search_query if search_query else None)
+
+    if data:
+        cache[cache_key] = data
+
+    return jsonify({
+        "success": True,
+        "cached": False,
+        "count": len(data),
+        "data": data
+    })
+
+@app.route('/api/details', methods=['GET'])
+def get_details():
+    """GET /api/details?url=... - Scrapes episode details and embed URL."""
+    anime_url = request.args.get('url', '').strip()
+    if not anime_url:
+        return jsonify({"success": False, "error": "Query parameter 'url' is required."}), 400
+
+    cache_key = f"details_{anime_url}"
+
+    if cache_key in cache:
+        logger.info(f"Serving details from cache: {cache_key}")
+        return jsonify({
+            "success": True,
+            "cached": True,
+            "data": cache[cache_key]
+        })
+
+    data = scrape_anime_details(anime_url)
+    if not data:
+        return jsonify({"success": False, "error": "Failed to scrape details from provided URL."}), 500
+
+    cache[cache_key] = data
+    return jsonify({
+        "success": True,
+        "cached": False,
+        "data": data
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
