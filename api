@@ -6,19 +6,18 @@ from cachetools import TTLCache
 import logging
 
 app = Flask(__name__)
-# Enable CORS so frontend applications (React, Next.js, HTML/JS) can call this API
+# Enable CORS for all origins
 CORS(app)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anime_api")
 
-# TTLCache stores up to 200 requests in memory for 900 seconds (15 minutes)
-cache = TTLCache(maxsize=200, ttl=900)
+# In-memory cache for 15 minutes (900 seconds)
+cache = TTLCache(maxsize=300, ttl=900)
 
 BASE_URL = "https://watchanimeworld.one"
 
-# Emulate browser headers to avoid request blocking
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -27,17 +26,17 @@ HEADERS = {
 }
 
 def fetch_soup(url):
-    """Utility function to fetch HTML content and return a BeautifulSoup parser object."""
+    """Utility function to fetch web pages and parse with BeautifulSoup."""
     try:
         response = requests.get(url, headers=HEADERS, timeout=12)
         response.raise_for_status()
         return BeautifulSoup(response.text, 'html.parser')
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error(f"Error fetching URL {url}: {e}")
         return None
 
 def scrape_anime_list(search_query=None):
-    """Scrapes trending or searched anime list from the target site."""
+    """Scrapes trending or searched anime items."""
     target_url = f"{BASE_URL}/?s={search_query}" if search_query else BASE_URL
     soup = fetch_soup(target_url)
     
@@ -46,11 +45,11 @@ def scrape_anime_list(search_query=None):
 
     anime_results = []
     
-    # Target common article/card containers on WP anime themes
-    articles = soup.find_all(['article', 'div'], class_=['post', 'item', 'animepost', 'bs', 'result-item'])
+    # Selectors for WordPress anime themes (watchanimeworld)
+    articles = soup.find_all(['article', 'div'], class_=['post', 'item', 'animepost', 'bs', 'result-item', 'col-md-3'])
     
     if not articles:
-        articles = soup.select('.listupd article, .result article, .animposx')
+        articles = soup.select('.listupd article, .result article, .animposx, .archive-post')
 
     for item in articles:
         try:
@@ -59,6 +58,8 @@ def scrape_anime_list(search_query=None):
                 continue
                 
             link = link_tag.get('href', '')
+            if not link or not link.startswith('http'):
+                continue
             
             # Extract title
             title = (
@@ -67,20 +68,20 @@ def scrape_anime_list(search_query=None):
                 or ""
             )
             
-            # Extract image source (handling lazy loading attributes)
+            # Extract poster image
             img_tag = item.find('img')
             img_url = ""
             if img_tag:
-                img_url = img_tag.get('data-src') or img_tag.get('src') or ""
+                img_url = img_tag.get('data-src') or img_tag.get('src') or img_tag.get('srcset', '').split(' ')[0] or ""
                 if img_url.startswith('//'):
                     img_url = 'https:' + img_url
 
-            # Extract episode tag / status
-            status_tag = item.find(class_=['epx', 'type', 'bt', 'sub', 'dub', 'status'])
-            status = status_tag.text.strip() if status_tag else "N/A"
+            # Extract episode / status tag
+            status_tag = item.find(class_=['epx', 'type', 'bt', 'sub', 'dub', 'status', 'limit'])
+            status = status_tag.text.strip() if status_tag else "SUB/DUB"
 
             # Extract snippet description
-            desc_tag = item.find(class_=['entry-content', 'excerpt', 'desc'])
+            desc_tag = item.find(class_=['entry-content', 'excerpt', 'desc', 'tt'])
             description = desc_tag.text.strip() if desc_tag else "No description available."
 
             if title and link:
@@ -92,13 +93,13 @@ def scrape_anime_list(search_query=None):
                     "description": description
                 })
         except Exception as e:
-            logger.warning(f"Error parsing anime item: {e}")
+            logger.warning(f"Error parsing item: {e}")
             continue
 
     return anime_results
 
 def scrape_anime_details(detail_url):
-    """Scrapes detailed anime info, synopsis, and episode streaming embeds."""
+    """Scrapes anime detail pages for synopsis and streaming embeds."""
     soup = fetch_soup(detail_url)
     if not soup:
         return None
@@ -125,7 +126,7 @@ def scrape_anime_details(detail_url):
                     "link": ep_href
                 })
 
-        # Extract iframe embed if on episode viewing page
+        # Embed URL if on video player page
         iframe = soup.find('iframe')
         embed_url = iframe.get('src') if iframe else None
 
@@ -137,12 +138,12 @@ def scrape_anime_details(detail_url):
             "embed_url": embed_url
         }
     except Exception as e:
-        logger.error(f"Error scraping details page: {e}")
+        logger.error(f"Error scraping details: {e}")
         return None
 
 @app.route('/', methods=['GET'])
 def index():
-    """Health check and API overview."""
+    """Root health check endpoint."""
     return jsonify({
         "status": "online",
         "service": "WatchAnimeWorld Scraping Proxy API",
@@ -156,7 +157,7 @@ def index():
 
 @app.route('/api/anime', methods=['GET'])
 def get_anime():
-    """GET /api/anime - Returns anime list (supports search query)."""
+    """GET /api/anime - Returns trending or searched anime."""
     search_query = request.args.get('search', '').strip()
     cache_key = f"list_{search_query}"
 
@@ -169,7 +170,7 @@ def get_anime():
             "data": cache[cache_key]
         })
 
-    logger.info(f"Fetching fresh data from source site for search='{search_query}'")
+    logger.info(f"Fetching fresh data for search='{search_query}'")
     data = scrape_anime_list(search_query if search_query else None)
 
     if data:
@@ -184,7 +185,7 @@ def get_anime():
 
 @app.route('/api/details', methods=['GET'])
 def get_details():
-    """GET /api/details?url=... - Scrapes episode details and embed URL."""
+    """GET /api/details?url=... - Returns anime synopsis and episode embeds."""
     anime_url = request.args.get('url', '').strip()
     if not anime_url:
         return jsonify({"success": False, "error": "Query parameter 'url' is required."}), 400
@@ -201,7 +202,7 @@ def get_details():
 
     data = scrape_anime_details(anime_url)
     if not data:
-        return jsonify({"success": False, "error": "Failed to scrape details from provided URL."}), 500
+        return jsonify({"success": False, "error": "Failed to scrape details from URL."}), 500
 
     cache[cache_key] = data
     return jsonify({
